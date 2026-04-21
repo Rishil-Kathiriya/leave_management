@@ -1,0 +1,48 @@
+django-admin startproject leavemanagement
+cd leavemanagement
+python manage.py startapp accounts
+
+venv
+
+
+pip install django
+pip install djangorestframework
+pip install djangorestframework-simplejwt
+pip install psycopg2-binary
+pip install python-dotenv
+
+
+
+CREATE DATABASE leavemanagement;
+
+
+
+bashpython manage.py makemigrations
+python manage.py migrate
+python manage.py runserver
+
+Now open Postman and test these:
+Register
+POST http://127.0.0.1:8000/auth/register/
+Body (JSON):
+{
+    "username": "rishil",
+    "email": "rishil@example.com",
+    "password": "test1234",
+    "role": "trainee",
+    "department": "Engineering"
+}
+
+
+
+Login
+POST http://127.0.0.1:8000/auth/login/
+Body (JSON):
+{
+    "username": "rishil",
+    "password": "test1234"
+}
+Login will return two tokens. Copy the access token. For any protected API going forward, add this in Postman under Headers:
+Authorization: Bearer <your_access_token>
+
+
