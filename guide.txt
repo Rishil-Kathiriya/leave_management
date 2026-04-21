@@ -46,3 +46,624 @@ Login will return two tokens. Copy the access token. For any protected API going
 Authorization: Bearer <your_access_token>
 
 
+
+
+
+
+
+
+
+# Step — Leave App
+
+---
+
+First create the leave app:
+
+```bash
+python manage.py startapp leaves
+```
+
+Then add it to `INSTALLED_APPS` in `settings.py`:
+
+```python
+INSTALLED_APPS = [
+    ...
+    'rest_framework',
+    'accounts',
+    'leaves',
+]
+```
+
+---
+
+# Leave Model
+
+Open `leaves/models.py` and write this:
+
+```python
+from django.db import models
+from django.conf import settings
+
+
+class Leave(models.Model):
+
+    LEAVE_TYPE_CHOICES = [
+        ('paid', 'Paid'),
+        ('unpaid', 'Unpaid'),
+        ('sick', 'Sick'),
+        ('casual', 'Casual'),
+    ]
+
+    APPROVAL_STATUS_CHOICES = [
+        ('pending', 'Pending'),
+        ('approved', 'Approved'),
+        ('rejected', 'Rejected'),
+        ('cancelled', 'Cancelled'),
+    ]
+
+    LEAVE_STATUS_CHOICES = [
+        ('open', 'Open'),
+        ('closed', 'Closed'),
+    ]
+
+    employee = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='leaves'
+    )
+
+    applied_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='applied_on_behalf'
+    )
+
+    title = models.CharField(max_length=200)
+    leave_type = models.CharField(max_length=20, choices=LEAVE_TYPE_CHOICES)
+    description = models.TextField(blank=True)
+    start_date = models.DateField()
+    end_date = models.DateField()
+
+    approval_status = models.CharField(
+        max_length=20,
+        choices=APPROVAL_STATUS_CHOICES,
+        default='pending'
+    )
+
+    approved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='approved_leaves'
+    )
+
+    leave_status = models.CharField(
+        max_length=10,
+        choices=LEAVE_STATUS_CHOICES,
+        default='open'
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"{self.employee.username} - {self.title} ({self.approval_status})"
+```
+
+What this does:
+
+`employee` is who the leave belongs to. `applied_by` is who actually submitted it. Most of the time these are the same person. But when HR applies on behalf of someone, `employee` will be that person and `applied_by` will be the HR.
+
+`approval_status` tracks whether the leave is pending, approved, rejected, or cancelled.
+
+`leave_status` tracks whether the leave request is still open or has been closed. Celery will auto-close it after the end date passes.
+
+`approved_by` stores who approved or rejected it.
+
+We use `settings.AUTH_USER_MODEL` instead of directly importing User because it is the safe way to reference a custom user model in Django.
+
+---
+
+# LeaveBalance Model
+
+Add this below the Leave model in the same file:
+
+```python
+class LeaveBalance(models.Model):
+
+    LEAVE_TYPE_CHOICES = [
+        ('paid', 'Paid'),
+        ('unpaid', 'Unpaid'),
+        ('sick', 'Sick'),
+        ('casual', 'Casual'),
+    ]
+
+    employee = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='leave_balances'
+    )
+
+    leave_type = models.CharField(max_length=20, choices=LEAVE_TYPE_CHOICES)
+    credited = models.FloatField(default=0)
+    used = models.FloatField(default=0)
+
+    @property
+    def remaining(self):
+        return self.credited - self.used
+
+    class Meta:
+        unique_together = ('employee', 'leave_type')
+
+    def __str__(self):
+        return f"{self.employee.username} - {self.leave_type} - Remaining: {self.remaining}"
+```
+
+What this does:
+
+Every employee will have one row per leave type here. For example, Rishil will have one row for paid, one for sick, one for casual.
+
+`credited` is how many days have been given. `used` is how many days have been consumed. `remaining` is a property — it is not stored in the database, it is calculated on the fly every time you access it.
+
+`unique_together` makes sure one employee cannot have two rows for the same leave type.
+
+---
+
+# Holiday Model
+
+Add this below LeaveBalance:
+
+```python
+class Holiday(models.Model):
+
+    date = models.DateField(unique=True)
+    day = models.CharField(max_length=20)
+    title = models.CharField(max_length=200)
+
+    def __str__(self):
+        return f"{self.title} - {self.date}"
+```
+
+Simple model. Just stores the date, which day of the week it is, and the holiday name.
+
+---
+
+# CustomNotifyList Model
+
+Add this below Holiday:
+
+```python
+class CustomNotifyList(models.Model):
+
+    employee = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='notify_list_owner'
+    )
+
+    notify_user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='notify_list_member'
+    )
+
+    class Meta:
+        unique_together = ('employee', 'notify_user')
+
+    def __str__(self):
+        return f"{self.employee.username} notifies {self.notify_user.username}"
+```
+
+This stores who an employee wants to notify when they take leave. One employee can add multiple people. `unique_together` prevents adding the same person twice.
+
+---
+
+# Run Migrations
+
+```bash
+python manage.py makemigrations
+python manage.py migrate
+```
+
+---
+
+Once this runs clean, reply back and we will write the serializers and views for applying leave, viewing leave, and the approval flow.
+
+
+
+
+
+
+
+
+
+
+
+
+# Leave Serializers
+
+Create a file `leaves/serializers.py` and write this:
+
+```python
+from rest_framework import serializers
+from .models import Leave, LeaveBalance, Holiday, CustomNotifyList
+
+
+class LeaveSerializer(serializers.ModelSerializer):
+
+    remaining_balance = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Leave
+        fields = [
+            'id',
+            'employee',
+            'applied_by',
+            'title',
+            'leave_type',
+            'description',
+            'start_date',
+            'end_date',
+            'approval_status',
+            'approved_by',
+            'leave_status',
+            'created_at',
+            'remaining_balance',
+        ]
+        read_only_fields = [
+            'employee',
+            'applied_by',
+            'approval_status',
+            'approved_by',
+            'leave_status',
+            'created_at',
+        ]
+
+    def get_remaining_balance(self, obj):
+        try:
+            balance = LeaveBalance.objects.get(
+                employee=obj.employee,
+                leave_type=obj.leave_type
+            )
+            return balance.remaining
+        except LeaveBalance.DoesNotExist:
+            return None
+
+    def validate(self, data):
+        if data['start_date'] > data['end_date']:
+            raise serializers.ValidationError("Start date cannot be after end date.")
+        return data
+
+
+class LeaveApprovalSerializer(serializers.ModelSerializer):
+
+    class Meta:
+        model = Leave
+        fields = ['approval_status']
+
+    def validate_approval_status(self, value):
+        if value not in ['approved', 'rejected']:
+            raise serializers.ValidationError("You can only approve or reject a leave.")
+        return value
+
+
+class LeaveBalanceSerializer(serializers.ModelSerializer):
+
+    remaining = serializers.ReadOnlyField()
+
+    class Meta:
+        model = LeaveBalance
+        fields = ['id', 'employee', 'leave_type', 'credited', 'used', 'remaining']
+        read_only_fields = ['employee']
+
+
+class HolidaySerializer(serializers.ModelSerializer):
+
+    class Meta:
+        model = Holiday
+        fields = ['id', 'date', 'day', 'title']
+
+
+class CustomNotifyListSerializer(serializers.ModelSerializer):
+
+    class Meta:
+        model = CustomNotifyList
+        fields = ['id', 'employee', 'notify_user']
+        read_only_fields = ['employee']
+```
+
+What this does:
+
+`LeaveSerializer` is the main one. It handles applying for leave. The `read_only_fields` list contains fields the user cannot set manually — these are set automatically by the system. For example, the employee is taken from whoever is logged in, not from what the user sends in the request.
+
+`get_remaining_balance` is a custom method. `SerializerMethodField` lets you add any extra data to the response that is not directly a field on the model. Here we fetch the leave balance and return the remaining days alongside the leave details.
+
+`validate` checks that start date is not after end date before saving.
+
+`LeaveApprovalSerializer` is a separate small serializer only used when HR or a manager approves or rejects. It only exposes the `approval_status` field because that is the only thing being updated in that action.
+
+`validate_approval_status` makes sure nobody can set the status to something invalid like `pending` through the approval endpoint.
+
+---
+
+# Leave Views
+
+Open `leaves/views.py` and write this:
+
+```python
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework import status
+from rest_framework.permissions import IsAuthenticated
+from django.shortcuts import get_object_or_404
+from .models import Leave, LeaveBalance, Holiday, CustomNotifyList
+from .serializers import (
+    LeaveSerializer,
+    LeaveApprovalSerializer,
+    LeaveBalanceSerializer,
+    HolidaySerializer,
+    CustomNotifyListSerializer,
+)
+
+
+# who can approve: HR or someone whose subordinates include the employee
+def can_approve(approver, employee):
+    if approver.is_hr or approver.is_staff:
+        return True
+    if employee.reports_to == approver:
+        return True
+    return False
+
+
+class LeaveListCreateView(APIView):
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        user = request.user
+
+        # Admin and HR see all leaves
+        if user.is_staff or user.is_hr:
+            leaves = Leave.objects.all()
+
+        # Team lead and above see their own + their subordinates leaves
+        elif user.role in ['team_lead', 'manager', 'engineering_manager', 'cto']:
+            subordinate_ids = user.subordinates.values_list('id', flat=True)
+            leaves = Leave.objects.filter(
+                employee__in=list(subordinate_ids) + [user.id]
+            )
+
+        # Everyone else sees only their own leaves
+        else:
+            leaves = Leave.objects.filter(employee=user)
+
+        # Optional filter by leave_status
+        leave_status = request.query_params.get('leave_status')
+        if leave_status:
+            leaves = leaves.filter(leave_status=leave_status)
+
+        serializer = LeaveSerializer(leaves, many=True)
+        return Response(serializer.data)
+
+    def post(self, request):
+        serializer = LeaveSerializer(data=request.data)
+        if serializer.is_valid():
+            serializer.save(
+                employee=request.user,
+                applied_by=request.user
+            )
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+class LeaveDetailView(APIView):
+
+    permission_classes = [IsAuthenticated]
+
+    def get_leave(self, leave_id):
+        return get_object_or_404(Leave, id=leave_id)
+
+    def get(self, request, leave_id):
+        leave = self.get_leave(leave_id)
+        user = request.user
+
+        # Check if this user is allowed to see this leave
+        is_own = leave.employee == user
+        is_subordinate = leave.employee.reports_to == user
+        is_hr_or_admin = user.is_hr or user.is_staff
+
+        if not (is_own or is_subordinate or is_hr_or_admin):
+            return Response(
+                {"error": "You do not have permission to view this leave."},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        serializer = LeaveSerializer(leave)
+        return Response(serializer.data)
+
+    def patch(self, request, leave_id):
+        leave = self.get_leave(leave_id)
+        user = request.user
+
+        # Only the employee themselves can cancel their own leave
+        if request.data.get('approval_status') == 'cancelled':
+            if leave.employee != user:
+                return Response(
+                    {"error": "You can only cancel your own leave."},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+            leave.approval_status = 'cancelled'
+            leave.save()
+            return Response({"message": "Leave cancelled."})
+
+        # Approval or rejection — check permission
+        if not can_approve(user, leave.employee):
+            return Response(
+                {"error": "You do not have permission to approve or reject this leave."},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        serializer = LeaveApprovalSerializer(leave, data=request.data, partial=True)
+        if serializer.is_valid():
+            serializer.save(approved_by=user)
+            return Response(serializer.data)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+class ApplyOnBehalfView(APIView):
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, emp_id):
+        from django.contrib.auth import get_user_model
+        User = get_user_model()
+
+        # Only HR or admin can apply on behalf
+        if not (request.user.is_hr or request.user.is_staff):
+            return Response(
+                {"error": "Only HR or Admin can apply leave on behalf of an employee."},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        employee = get_object_or_404(User, id=emp_id)
+        serializer = LeaveSerializer(data=request.data)
+        if serializer.is_valid():
+            serializer.save(
+                employee=employee,
+                applied_by=request.user
+            )
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+class LeaveBalanceView(APIView):
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        balances = LeaveBalance.objects.filter(employee=request.user)
+        serializer = LeaveBalanceSerializer(balances, many=True)
+        return Response(serializer.data)
+
+
+class HolidayListView(APIView):
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        holidays = Holiday.objects.all().order_by('date')
+        serializer = HolidaySerializer(holidays, many=True)
+        return Response(serializer.data)
+
+
+class CustomNotifyListView(APIView):
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        notify_list = CustomNotifyList.objects.filter(employee=request.user)
+        serializer = CustomNotifyListSerializer(notify_list, many=True)
+        return Response(serializer.data)
+
+    def post(self, request):
+        serializer = CustomNotifyListSerializer(data=request.data)
+        if serializer.is_valid():
+            serializer.save(employee=request.user)
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    def delete(self, request, notify_id):
+        notify = get_object_or_404(
+            CustomNotifyList,
+            id=notify_id,
+            employee=request.user
+        )
+        notify.delete()
+        return Response({"message": "Removed from notify list."})
+```
+
+What this does:
+
+`can_approve` is a helper function. Before approving any leave, we call this to check if the person trying to approve actually has the right to do so. HR and Admin can approve anyone. A manager can only approve their direct reportees.
+
+`LeaveListCreateView` handles two things. GET returns leaves based on who is asking. Admin and HR see everything. Team leads and above see their own and their team's leaves. Everyone else sees only their own. POST is for applying leave — we automatically set employee and applied_by to the logged in user.
+
+`LeaveDetailView` handles fetching a single leave and updating it. The PATCH method handles both cancellation and approval. If the status being sent is `cancelled`, only the owner can do it. For anything else, `can_approve` is checked.
+
+`ApplyOnBehalfView` is a separate endpoint only for HR and Admin. They pass the employee's id in the URL and apply leave for that person.
+
+---
+
+# Leave URLs
+
+Create `leaves/urls.py`:
+
+```python
+from django.urls import path
+from .views import (
+    LeaveListCreateView,
+    LeaveDetailView,
+    ApplyOnBehalfView,
+    LeaveBalanceView,
+    HolidayListView,
+    CustomNotifyListView,
+)
+
+urlpatterns = [
+    path('', LeaveListCreateView.as_view(), name='leave-list-create'),
+    path('<int:leave_id>/', LeaveDetailView.as_view(), name='leave-detail'),
+    path('behalf/<int:emp_id>/', ApplyOnBehalfView.as_view(), name='apply-on-behalf'),
+    path('balance/', LeaveBalanceView.as_view(), name='leave-balance'),
+    path('holidays/', HolidayListView.as_view(), name='holiday-list'),
+    path('notify/', CustomNotifyListView.as_view(), name='notify-list'),
+    path('notify/<int:notify_id>/', CustomNotifyListView.as_view(), name='notify-delete'),
+]
+```
+
+Now open `leavemanagement/urls.py` and add the leaves URLs:
+
+```python
+from django.contrib import admin
+from django.urls import path, include
+
+urlpatterns = [
+    path('admin/', admin.site.urls),
+    path('auth/', include('accounts.urls')),
+    path('leaves/', include('leaves.urls')),
+]
+```
+
+---
+
+# Run and Test
+
+```bash
+python manage.py runserver
+```
+
+Test in Postman. First login to get your token, then add it in headers as:
+
+```
+Authorization: Bearer <your_access_token>
+```
+
+Then test these:
+
+```
+POST   /leaves/                         Apply for leave
+GET    /leaves/                         See your leaves
+GET    /leaves/1/                       See a specific leave
+PATCH  /leaves/1/                       Approve, Reject, or Cancel
+POST   /leaves/behalf/3/               HR applies for employee with id 3
+GET    /leaves/balance/                 See your leave balance
+GET    /leaves/holidays/               See all holidays
+GET    /leaves/notify/                  See your notify list
+POST   /leaves/notify/                  Add someone to notify list
+DELETE /leaves/notify/1/               Remove from notify list
+```
+
+---
+
+Once this is working, reply back and we will set up Celery for background email notifications.

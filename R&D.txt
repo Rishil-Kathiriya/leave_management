@@ -1,0 +1,62 @@
+System
+
+hierarchy. Every employee has someone above them who is responsible for approving their leave:
+Trainee -> Software Engineer -> Senior Software Engineer -> Team Lead -> Manager -> Engineering Manager -> CTO
+Each person's leave is approved by their direct reporting manager. The person two levels above is also notified, so they are aware without being the decision-maker.
+
+
+
+Approval Logic
+
+When someone applies for leave, the request goes to their immediate upper. That person approves or rejects it. Two levels up gets a notification just to stay informed. This keeps the chain clean — one decision-maker per request, no confusion.
+HR sits outside this chain. HR is an administrative role. They can approve or reject anyone's leave, apply leave on behalf of any employee, and see everything across the organization. They do not receive hierarchy-based notifications though.
+For Team Lead and above, HR is not notified when they apply. But HR can still see it on the portal and still has the authority to approve or reject it. Other team members below that person can also see on the portal that their lead is on leave — they just don't get an email about it.
+
+
+
+Notifications
+
+Four things trigger a notification:
+When someone applies for leave, their direct upper and the person two levels above both get an email. This runs in the background via Celery so it does not slow down the request.
+When a leave is approved or rejected, the applicant gets an email immediately.
+One day before the leave starts, a reminder goes out to the applicant and their approver. This is handled by a scheduled Celery Beat job that runs daily.
+Employees can also add custom people to their notify list. If someone is collaborating closely with a colleague outside their reporting chain, they can add that person so they are also informed when leave is taken.
+
+
+
+Leave Balance
+Every employee gets paid leave credited monthly. The system tracks total credited leaves, how many have been used, and how many are remaining. There are also restrictions — certain leave types have limits, like a maximum number of consecutive days, or a cap on how many people from the same team can be on leave at once. The exact rules need to be confirmed with the mentor before implementation.
+
+
+
+Celery Tasks
+
+Five background tasks run in this system:
+A notification is sent to the approver and second-level upper whenever leave is applied. This is an async task triggered by a signal.
+An email is sent to the employee on approval or rejection. Also async, triggered by a signal.
+A daily job checks for leaves starting the next day and sends reminders.
+A daily job auto closes leave requests where the end date has passed.
+A monthly job deletes leave records that were cancelled more than 30 days ago.
+
+
+
+Models
+
+Employee - stores emp_id, name, department, email, designation, reports_to (self-referential foreign key to track the hierarchy), and is_hr flag set by admin.
+Leave - stores leave_id, title, leave type, description, start date, end date, approval status, applied by, approved by, on behalf of (used when HR applies for someone else), and whether the request is open or closed.
+LeaveBalance - per employee, per leave type. Tracks total credited, used, and remaining days. Carry-forward can be added later.
+Holidays - date, day name, and title of the holiday. Visible to all roles.
+Notification - stores who was notified, for which leave, at what time, and the reason (applied, approved, rejected, reminder).
+CustomNotifyList - maps an employee to additional colleagues they want notified when they take leave.
+
+
+
+Roles Summary
+
+Admin has full access. They approve leaves for everyone including HR, manage the is_hr flag, and can see all reports.
+HR can approve or reject any employee's leave, apply leave on behalf of any employee, and view everything on the portal.
+Team Leads and above approve leaves for their direct reportees. Their own leaves are approved by their upper.
+Employees and Trainees can apply for leave, check status, view history, and see the holiday list.
+employees below a Team Lead can see that their lead is on leave through the portal, but they have zero write access to that record.
+
+
