@@ -667,3 +667,1342 @@ DELETE /leaves/notify/1/               Remove from notify list
 ---
 
 Once this is working, reply back and we will set up Celery for background email notifications.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Let me address all your points one by one before giving you the updated code.
+
+---
+
+## Clarifications
+
+**CTO as Superadmin** — Good thinking but not quite right. Django's superadmin (is_superuser) is a technical role for managing the system itself. CTO is a business role. Keep them separate. A real employee who is CTO should have their own account with role=CTO. The Django superadmin account should only be used for system management. CTO approves Engineering Manager leaves, that is their only special business privilege.
+
+**reports_to in admin dashboard** — You see it because Django automatically shows all model fields in the admin panel. It is just a foreign key pointing to another user. When you create an employee, you select who they report to from the dropdown. This is correct behavior. By default every leave goes to whoever is set in reports_to.
+
+**Username vs Email** — Correct decision. We will switch to email-based login since multiple employees can share the same name.
+
+**CTO and Engineering Manager department** — They will have department as blank/null since they are org-wide roles.
+
+**HR adding holidays and leave balance** — Makes sense. We will restrict those endpoints to HR only.
+
+---
+
+## Changes Needed in Previous Code
+
+---
+
+### Change 1 — accounts/models.py
+
+Replace your entire model with this:
+
+```python
+from django.contrib.auth.models import AbstractUser, BaseUserManager
+from django.db import models
+
+
+class UserManager(BaseUserManager):
+
+    def create_user(self, email, password=None, **extra_fields):
+        if not email:
+            raise ValueError("Email is required.")
+        email = self.normalize_email(email)
+        user = self.model(email=email, **extra_fields)
+        user.set_password(password)
+        user.save()
+        return user
+
+    def create_superuser(self, email, password=None, **extra_fields):
+        extra_fields.setdefault('is_staff', True)
+        extra_fields.setdefault('is_superuser', True)
+        return self.create_user(email, password, **extra_fields)
+
+
+class User(AbstractUser):
+
+    ROLE_CHOICES = [
+        ('trainee', 'Trainee'),
+        ('software_engineer', 'Software Engineer'),
+        ('senior_software_engineer', 'Senior Software Engineer'),
+        ('team_lead', 'Team Lead'),
+        ('manager', 'Manager'),
+        ('engineering_manager', 'Engineering Manager'),
+        ('cto', 'CTO'),
+        ('hr', 'HR'),
+    ]
+
+    username = None
+    email = models.EmailField(unique=True)
+    full_name = models.CharField(max_length=200)
+    role = models.CharField(max_length=50, choices=ROLE_CHOICES, default='trainee')
+    department = models.CharField(max_length=100, blank=True, null=True)
+    is_hr = models.BooleanField(default=False)
+    reports_to = models.ForeignKey(
+        'self',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='subordinates'
+    )
+
+    USERNAME_FIELD = 'email'
+    REQUIRED_FIELDS = ['full_name']
+
+    objects = UserManager()
+
+    def __str__(self):
+        return f"{self.full_name} ({self.role})"
+```
+
+What changed: removed username, added full_name, added custom UserManager so Django knows to use email for login and for creating superuser via terminal.
+
+---
+
+### Change 2 — accounts/serializers.py
+
+Replace entire file:
+
+```python
+from rest_framework import serializers
+from django.contrib.auth import get_user_model
+
+User = get_user_model()
+
+
+class RegisterSerializer(serializers.ModelSerializer):
+
+    password = serializers.CharField(write_only=True)
+
+    class Meta:
+        model = User
+        fields = [
+            'email',
+            'full_name',
+            'password',
+            'role',
+            'department',
+            'reports_to',
+        ]
+
+    def create(self, validated_data):
+        password = validated_data.pop('password')
+        user = User(**validated_data)
+        user.set_password(password)
+        user.save()
+        return user
+
+
+class UserSerializer(serializers.ModelSerializer):
+
+    class Meta:
+        model = User
+        fields = [
+            'id',
+            'email',
+            'full_name',
+            'role',
+            'department',
+            'is_hr',
+            'reports_to',
+        ]
+```
+
+---
+
+### Change 3 — leaves/serializers.py
+
+Replace entire file:
+
+```python
+from rest_framework import serializers
+from django.contrib.auth import get_user_model
+from .models import Leave, LeaveBalance, Holiday, CustomNotifyList
+
+User = get_user_model()
+
+
+class BasicUserSerializer(serializers.ModelSerializer):
+
+    class Meta:
+        model = User
+        fields = ['id', 'full_name', 'email', 'role', 'department']
+
+
+class LeaveSerializer(serializers.ModelSerializer):
+
+    remaining_balance = serializers.SerializerMethodField()
+    employee_detail = BasicUserSerializer(source='employee', read_only=True)
+    applied_by_detail = BasicUserSerializer(source='applied_by', read_only=True)
+    approved_by_detail = BasicUserSerializer(source='approved_by', read_only=True)
+
+    class Meta:
+        model = Leave
+        fields = [
+            'id',
+            'employee',
+            'employee_detail',
+            'applied_by',
+            'applied_by_detail',
+            'title',
+            'leave_type',
+            'description',
+            'start_date',
+            'end_date',
+            'approval_status',
+            'approved_by',
+            'approved_by_detail',
+            'leave_status',
+            'created_at',
+            'remaining_balance',
+        ]
+        read_only_fields = [
+            'employee',
+            'applied_by',
+            'approval_status',
+            'approved_by',
+            'leave_status',
+            'created_at',
+        ]
+
+    def get_remaining_balance(self, obj):
+        try:
+            balance = LeaveBalance.objects.get(
+                employee=obj.employee,
+                leave_type=obj.leave_type
+            )
+            return balance.remaining
+        except LeaveBalance.DoesNotExist:
+            return None
+
+    def validate(self, data):
+        if data['start_date'] > data['end_date']:
+            raise serializers.ValidationError("Start date cannot be after end date.")
+        return data
+
+
+class LeaveApprovalSerializer(serializers.ModelSerializer):
+
+    class Meta:
+        model = Leave
+        fields = ['approval_status']
+
+    def validate_approval_status(self, value):
+        if value not in ['approved', 'rejected']:
+            raise serializers.ValidationError("You can only approve or reject a leave.")
+        return value
+
+
+class LeaveBalanceSerializer(serializers.ModelSerializer):
+
+    remaining = serializers.ReadOnlyField()
+
+    class Meta:
+        model = LeaveBalance
+        fields = ['id', 'employee', 'leave_type', 'credited', 'used', 'remaining']
+        read_only_fields = ['employee']
+
+
+class HolidaySerializer(serializers.ModelSerializer):
+
+    class Meta:
+        model = Holiday
+        fields = ['id', 'date', 'day', 'title']
+
+
+class CustomNotifyListSerializer(serializers.ModelSerializer):
+
+    class Meta:
+        model = CustomNotifyList
+        fields = ['id', 'employee', 'notify_user']
+        read_only_fields = ['employee']
+```
+
+What changed: Added `BasicUserSerializer` which is a small nested serializer. When you get leave details, instead of just seeing an employee ID you will now see their full name, email, role and department. Same for applied_by and approved_by.
+
+---
+
+### Change 4 — leaves/views.py
+
+Replace entire file:
+
+```python
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework import status
+from rest_framework.permissions import IsAuthenticated
+from django.shortcuts import get_object_or_404
+from django.contrib.auth import get_user_model
+from .models import Leave, LeaveBalance, Holiday, CustomNotifyList
+from .serializers import (
+    LeaveSerializer,
+    LeaveApprovalSerializer,
+    LeaveBalanceSerializer,
+    HolidaySerializer,
+    CustomNotifyListSerializer,
+)
+
+User = get_user_model()
+
+HIERARCHY = [
+    'trainee',
+    'software_engineer',
+    'senior_software_engineer',
+    'team_lead',
+    'manager',
+    'engineering_manager',
+    'cto',
+]
+
+
+def can_approve(approver, employee):
+    # Superadmin and HR can approve anyone
+    if approver.is_superuser or approver.is_hr or approver.role == 'hr':
+        return True
+    # CTO can approve engineering manager
+    if approver.role == 'cto' and employee.role == 'engineering_manager':
+        return True
+    # Direct upper can approve
+    if employee.reports_to and employee.reports_to == approver:
+        return True
+    return False
+
+
+def can_apply_on_behalf(requester, target_employee):
+    # HR can apply for anyone
+    if requester.is_hr or requester.role == 'hr':
+        return True
+    # Upper layer can apply for their direct subordinates
+    if target_employee.reports_to and target_employee.reports_to == requester:
+        return True
+    # Check if requester is 2 levels above
+    if (target_employee.reports_to and
+            target_employee.reports_to.reports_to and
+            target_employee.reports_to.reports_to == requester):
+        return True
+    return False
+
+
+def can_view_leave(viewer, leave):
+    employee = leave.employee
+
+    # Superadmin, HR see everything
+    if viewer.is_superuser or viewer.is_hr or viewer.role == 'hr':
+        return True
+
+    # Own leave
+    if employee == viewer:
+        return True
+
+    # Direct upper (1 level)
+    if employee.reports_to == viewer:
+        return True
+
+    # 2 levels upper
+    if employee.reports_to and employee.reports_to.reports_to == viewer:
+        return True
+
+    return False
+
+
+class LeaveListCreateView(APIView):
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        user = request.user
+
+        if user.is_superuser or user.is_hr or user.role == 'hr':
+            leaves = Leave.objects.all()
+
+        elif user.role in ['team_lead', 'manager', 'engineering_manager', 'cto']:
+            # Direct subordinates
+            direct_ids = list(user.subordinates.values_list('id', flat=True))
+
+            # 2 levels below
+            second_level_ids = list(
+                User.objects.filter(reports_to__in=direct_ids).values_list('id', flat=True)
+            )
+
+            all_ids = set(direct_ids + second_level_ids + [user.id])
+            leaves = Leave.objects.filter(employee__in=all_ids)
+
+        else:
+            leaves = Leave.objects.filter(employee=user)
+
+        leave_status = request.query_params.get('leave_status')
+        if leave_status:
+            leaves = leaves.filter(leave_status=leave_status)
+
+        serializer = LeaveSerializer(leaves, many=True)
+        return Response(serializer.data)
+
+    def post(self, request):
+        serializer = LeaveSerializer(data=request.data)
+        if serializer.is_valid():
+            serializer.save(
+                employee=request.user,
+                applied_by=request.user
+            )
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+class LeaveDetailView(APIView):
+
+    permission_classes = [IsAuthenticated]
+
+    def get_leave(self, leave_id):
+        return get_object_or_404(Leave, id=leave_id)
+
+    def get(self, request, leave_id):
+        leave = self.get_leave(leave_id)
+
+        if not can_view_leave(request.user, leave):
+            return Response(
+                {"error": "You do not have permission to view this leave."},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        serializer = LeaveSerializer(leave)
+        return Response(serializer.data)
+
+    def patch(self, request, leave_id):
+        leave = self.get_leave(leave_id)
+        user = request.user
+
+        if request.data.get('approval_status') == 'cancelled':
+            if leave.employee != user:
+                return Response(
+                    {"error": "You can only cancel your own leave."},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+            leave.approval_status = 'cancelled'
+            leave.save()
+            return Response({"message": "Leave cancelled successfully."})
+
+        if not can_approve(user, leave.employee):
+            return Response(
+                {"error": "You do not have permission to approve or reject this leave."},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        serializer = LeaveApprovalSerializer(leave, data=request.data, partial=True)
+        if serializer.is_valid():
+            serializer.save(approved_by=user)
+            return Response({
+                "message": f"Leave {serializer.data['approval_status']} by {user.full_name}.",
+                "data": serializer.data
+            })
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+class ApplyOnBehalfView(APIView):
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, emp_id):
+        employee = get_object_or_404(User, id=emp_id)
+
+        if not can_apply_on_behalf(request.user, employee):
+            return Response(
+                {"error": "You do not have permission to apply leave for this employee."},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        serializer = LeaveSerializer(data=request.data)
+        if serializer.is_valid():
+            serializer.save(
+                employee=employee,
+                applied_by=request.user
+            )
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+class LeaveBalanceView(APIView):
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        balances = LeaveBalance.objects.filter(employee=request.user)
+        serializer = LeaveBalanceSerializer(balances, many=True)
+        return Response(serializer.data)
+
+
+class HolidayListView(APIView):
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        holidays = Holiday.objects.all().order_by('date')
+        serializer = HolidaySerializer(holidays, many=True)
+        return Response(serializer.data)
+
+    def post(self, request):
+        # Only HR can add holidays
+        if not (request.user.is_hr or request.user.role == 'hr'):
+            return Response(
+                {"error": "Only HR can add holidays."},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        serializer = HolidaySerializer(data=request.data)
+        if serializer.is_valid():
+            serializer.save()
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+class LeaveBalanceManageView(APIView):
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        # Only HR can credit leave balance
+        if not (request.user.is_hr or request.user.role == 'hr'):
+            return Response(
+                {"error": "Only HR can manage leave balances."},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        serializer = LeaveBalanceSerializer(data=request.data)
+        if serializer.is_valid():
+            employee_id = request.data.get('employee')
+            leave_type = request.data.get('leave_type')
+            balance, created = LeaveBalance.objects.get_or_create(
+                employee_id=employee_id,
+                leave_type=leave_type,
+                defaults={'credited': 0, 'used': 0}
+            )
+            balance.credited += float(request.data.get('credited', 0))
+            balance.save()
+            return Response(
+                LeaveBalanceSerializer(balance).data,
+                status=status.HTTP_200_OK
+            )
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+class CustomNotifyListView(APIView):
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        notify_list = CustomNotifyList.objects.filter(employee=request.user)
+        serializer = CustomNotifyListSerializer(notify_list, many=True)
+        return Response(serializer.data)
+
+    def post(self, request):
+        serializer = CustomNotifyListSerializer(data=request.data)
+        if serializer.is_valid():
+            serializer.save(employee=request.user)
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    def delete(self, request, notify_id):
+        notify = get_object_or_404(
+            CustomNotifyList,
+            id=notify_id,
+            employee=request.user
+        )
+        notify.delete()
+        return Response({"message": "Removed from notify list."})
+```
+
+---
+
+Now run migrations since the User model changed:
+
+```bash
+python manage.py makemigrations
+python manage.py migrate
+```
+
+Create superuser with email now:
+
+```bash
+python manage.py createsuperuser
+```
+
+It will ask for email, full_name, and password now instead of username.
+
+---
+
+# API Testing Guide
+
+---
+
+## 1. Register
+
+```
+POST /auth/register/
+
+{
+    "email": "rishil@example.com",
+    "full_name": "Rishil Kathiriya",
+    "password": "test1234",
+    "role": "trainee",
+    "department": "Engineering",
+    "reports_to": 2
+}
+```
+
+reports_to is the ID of whoever this person reports to. Leave it out if they have no upper.
+
+---
+
+## 2. Login
+
+```
+POST /auth/login/
+
+{
+    "email": "rishil@example.com",
+    "password": "test1234"
+}
+```
+
+Response will give you access and refresh tokens. Copy the access token.
+
+In every request after this, add this header:
+
+```
+Authorization: Bearer <paste_access_token_here>
+```
+
+---
+
+## 3. Apply for Leave
+
+```
+POST /leaves/
+
+{
+    "title": "Vacation",
+    "leave_type": "paid",
+    "description": "Going on a trip",
+    "start_date": "2025-05-01",
+    "end_date": "2025-05-03"
+}
+```
+
+---
+
+## 4. See All Your Leaves
+
+```
+GET /leaves/
+```
+
+Filter by status:
+
+```
+GET /leaves/?leave_status=open
+```
+
+---
+
+## 5. See Single Leave
+
+```
+GET /leaves/1/
+```
+
+Response will now include full employee name, email, and who approved it.
+
+---
+
+## 6. Approve or Reject Leave (upper layer or HR)
+
+```
+PATCH /leaves/1/
+
+{
+    "approval_status": "approved"
+}
+```
+
+or
+
+```
+PATCH /leaves/1/
+
+{
+    "approval_status": "rejected"
+}
+```
+
+---
+
+## 7. Cancel Your Own Leave
+
+```
+PATCH /leaves/1/
+
+{
+    "approval_status": "cancelled"
+}
+```
+
+---
+
+## 8. Apply Leave on Behalf (HR or upper layer only)
+
+```
+POST /leaves/behalf/3/
+
+{
+    "title": "Sick Leave",
+    "leave_type": "sick",
+    "description": "Employee is unwell",
+    "start_date": "2025-05-01",
+    "end_date": "2025-05-01"
+}
+```
+
+3 here is the employee ID you are applying for.
+
+---
+
+## 9. See Leave Balance
+
+```
+GET /leaves/balance/
+```
+
+---
+
+## 10. See Holidays
+
+```
+GET /leaves/holidays/
+```
+
+---
+
+## 11. Add Holiday (HR only)
+
+```
+POST /leaves/holidays/
+
+{
+    "date": "2025-08-15",
+    "day": "Friday",
+    "title": "Independence Day"
+}
+```
+
+---
+
+## 12. Credit Leave Balance (HR only)
+
+```
+POST /leaves/balance/manage/
+
+{
+    "employee": 3,
+    "leave_type": "paid",
+    "credited": 1.5
+}
+```
+
+---
+
+## 13. Add Someone to Notify List
+
+```
+POST /leaves/notify/
+
+{
+    "notify_user": 4
+}
+```
+
+---
+
+## 14. See Your Notify List
+
+```
+GET /leaves/notify/
+```
+
+---
+
+## 15. Remove from Notify List
+
+```
+DELETE /leaves/notify/1/
+```
+
+---
+
+Also add the new balance manage URL in `leaves/urls.py`:
+
+```python
+from .views import LeaveBalanceManageView
+
+# add this line in urlpatterns
+path('balance/manage/', LeaveBalanceManageView.as_view(), name='leave-balance-manage'),
+```
+
+---
+
+Once you test all of this and it works, reply back and we will set up Celery for background email notifications.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Celery Setup
+
+---
+
+## Step 1 — Install Required Packages
+
+```bash
+pip install celery
+pip install redis
+pip install django-celery-beat
+```
+
+What each one does:
+
+`celery` — the task queue that runs jobs in the background.
+
+`redis` — celery needs a broker to receive and store tasks. Redis acts as that broker.
+
+`django-celery-beat` — lets you schedule periodic tasks (like daily reminders) from the database instead of hardcoding them.
+
+---
+
+## Step 2 — Install Redis on Windows
+
+Go to this link and download the latest release zip file:
+
+```
+https://github.com/microsoftarchive/redis/releases
+```
+
+Download `Redis-x64-3.0.504.zip`, extract it, and open the folder. Double click `redis-server.exe` to start Redis. Keep that window open. Redis runs on port 6379 by default.
+
+To confirm Redis is running, open another terminal in the same folder and run:
+
+```bash
+redis-cli ping
+```
+
+If it replies `PONG`, Redis is working.
+
+---
+
+## Step 3 — Update settings.py
+
+Add these lines anywhere in your settings.py:
+
+```python
+CELERY_BROKER_URL = 'redis://localhost:6379/0'
+CELERY_RESULT_BACKEND = 'redis://localhost:6379/0'
+CELERY_TIMEZONE = 'Asia/Kolkata'
+
+INSTALLED_APPS = [
+    ...
+    'django_celery_beat',
+]
+```
+
+`CELERY_BROKER_URL` tells Celery where to send tasks. Redis is running locally on port 6379.
+
+`CELERY_RESULT_BACKEND` is where Celery stores task results.
+
+`CELERY_TIMEZONE` makes sure scheduled tasks fire at the right time for your timezone.
+
+`django_celery_beat` needs to be in INSTALLED_APPS so it can store schedules in your database.
+
+---
+
+## Step 4 — Create celery.py
+
+Create a new file inside your `leavemanagement` folder (same folder as settings.py) called `celery.py`:
+
+```python
+import os
+from celery import Celery
+
+os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'leavemanagement.settings')
+
+app = Celery('leavemanagement')
+app.config_from_object('django.conf:settings', namespace='CELERY')
+app.autodiscover_tasks()
+```
+
+What this does:
+
+This is the main Celery application. `os.environ.setdefault` tells Celery which Django settings to use. `autodiscover_tasks` means Celery will automatically find any file named `tasks.py` inside your apps and register those tasks.
+
+---
+
+## Step 5 — Update __init__.py
+
+Open `leavemanagement/__init__.py` and add this:
+
+```python
+from .celery import app as celery_app
+
+__all__ = ('celery_app',)
+```
+
+This makes sure Celery starts whenever Django starts.
+
+---
+
+## Step 6 — Add Email Settings
+
+Add these to your `.env` file:
+
+```
+EMAIL_HOST=smtp.gmail.com
+EMAIL_PORT=587
+EMAIL_HOST_USER=your_company_email@gmail.com
+EMAIL_HOST_PASSWORD=your_app_password
+```
+
+Then add these to `settings.py`:
+
+```python
+EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
+EMAIL_HOST = os.getenv('EMAIL_HOST')
+EMAIL_PORT = int(os.getenv('EMAIL_PORT'))
+EMAIL_USE_TLS = True
+EMAIL_HOST_USER = os.getenv('EMAIL_HOST_USER')
+EMAIL_HOST_PASSWORD = os.getenv('EMAIL_HOST_PASSWORD')
+DEFAULT_FROM_EMAIL = os.getenv('EMAIL_HOST_USER')
+```
+
+For Gmail you need an App Password, not your regular Gmail password. Go to your Google account, search for App Passwords, create one for Mail, and paste that 16 character password in EMAIL_HOST_PASSWORD.
+
+---
+
+## Step 7 — Create tasks.py in leaves app
+
+Create `leaves/tasks.py`:
+
+```python
+from celery import shared_task
+from django.core.mail import send_mail
+from django.conf import settings
+from django.utils import timezone
+
+
+@shared_task
+def send_leave_applied_notification(leave_id):
+    from .models import Leave
+
+    try:
+        leave = Leave.objects.select_related(
+            'employee',
+            'employee__reports_to',
+            'employee__reports_to__reports_to'
+        ).get(id=leave_id)
+
+    except Leave.DoesNotExist:
+        return
+
+    employee = leave.employee
+    recipients = []
+
+    # Direct upper gets notified
+    if employee.reports_to:
+        recipients.append(employee.reports_to.email)
+
+    # 2 levels upper also gets notified
+    if employee.reports_to and employee.reports_to.reports_to:
+        recipients.append(employee.reports_to.reports_to.email)
+
+    # Custom notify list also gets notified
+    from .models import CustomNotifyList
+    custom_notifyees = CustomNotifyList.objects.filter(
+        employee=employee
+    ).values_list('notify_user__email', flat=True)
+
+    recipients += list(custom_notifyees)
+
+    if not recipients:
+        return
+
+    subject = f"Leave Application - {employee.full_name}"
+    message = (
+        f"{employee.full_name} has applied for {leave.leave_type} leave.\n\n"
+        f"Title: {leave.title}\n"
+        f"From: {leave.start_date}\n"
+        f"To: {leave.end_date}\n"
+        f"Reason: {leave.description}\n\n"
+        f"Please review and take action."
+    )
+
+    send_mail(
+        subject=subject,
+        message=message,
+        from_email=settings.DEFAULT_FROM_EMAIL,
+        recipient_list=recipients,
+        fail_silently=False,
+    )
+
+
+@shared_task
+def send_leave_status_notification(leave_id):
+    from .models import Leave
+
+    try:
+        leave = Leave.objects.select_related(
+            'employee',
+            'approved_by'
+        ).get(id=leave_id)
+
+    except Leave.DoesNotExist:
+        return
+
+    action = leave.approval_status.capitalize()
+    approved_by_name = leave.approved_by.full_name if leave.approved_by else "System"
+
+    subject = f"Your Leave has been {action}"
+    message = (
+        f"Dear {leave.employee.full_name},\n\n"
+        f"Your leave request titled '{leave.title}' has been {action} "
+        f"by {approved_by_name}.\n\n"
+        f"From: {leave.start_date}\n"
+        f"To: {leave.end_date}\n\n"
+        f"Thank you."
+    )
+
+    send_mail(
+        subject=subject,
+        message=message,
+        from_email=settings.DEFAULT_FROM_EMAIL,
+        recipient_list=[leave.employee.email],
+        fail_silently=False,
+    )
+
+
+@shared_task
+def send_leave_reminder():
+    from .models import Leave
+
+    tomorrow = timezone.now().date() + timezone.timedelta(days=1)
+
+    leaves = Leave.objects.select_related(
+        'employee',
+        'employee__reports_to'
+    ).filter(
+        start_date=tomorrow,
+        approval_status='approved',
+        leave_status='open'
+    )
+
+    for leave in leaves:
+        employee = leave.employee
+        recipients = [employee.email]
+
+        if employee.reports_to:
+            recipients.append(employee.reports_to.email)
+
+        subject = f"Leave Reminder - {employee.full_name} is on leave tomorrow"
+        message = (
+            f"This is a reminder that {employee.full_name} has an approved leave tomorrow.\n\n"
+            f"Title: {leave.title}\n"
+            f"Date: {leave.start_date} to {leave.end_date}\n"
+        )
+
+        send_mail(
+            subject=subject,
+            message=message,
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            recipient_list=recipients,
+            fail_silently=False,
+        )
+
+
+@shared_task
+def auto_close_expired_leaves():
+    from .models import Leave
+
+    today = timezone.now().date()
+
+    updated = Leave.objects.filter(
+        end_date__lt=today,
+        leave_status='open'
+    ).update(leave_status='closed')
+
+    return f"{updated} leaves closed."
+
+
+@shared_task
+def delete_old_cancelled_leaves():
+    from .models import Leave
+
+    one_month_ago = timezone.now() - timezone.timedelta(days=30)
+
+    deleted, _ = Leave.objects.filter(
+        approval_status='cancelled',
+        created_at__lt=one_month_ago
+    ).delete()
+
+    return f"{deleted} cancelled leaves deleted."
+```
+
+What each task does:
+
+`send_leave_applied_notification` — fires when someone applies for leave. Sends email to direct upper, 2nd level upper, and anyone on the custom notify list.
+
+`send_leave_status_notification` — fires when leave is approved or rejected. Sends email to the employee mentioning who approved or rejected it.
+
+`send_leave_reminder` — runs daily. Checks if any approved leaves start tomorrow and sends a reminder to the employee and their upper.
+
+`auto_close_expired_leaves` — runs daily. Finds all leaves whose end date has passed and marks them closed.
+
+`delete_old_cancelled_leaves` — runs monthly. Deletes cancelled leave records older than 30 days to keep the database clean.
+
+---
+
+## Step 8 — Connect Tasks to Views using Signals
+
+Create `leaves/signals.py`:
+
+```python
+from django.db.models.signals import post_save
+from django.dispatch import receiver
+from .models import Leave
+
+
+@receiver(post_save, sender=Leave)
+def leave_post_save(sender, instance, created, **kwargs):
+    from .tasks import send_leave_applied_notification, send_leave_status_notification
+
+    # When a new leave is created, notify upper layers
+    if created:
+        send_leave_applied_notification.delay(instance.id)
+
+    # When leave is approved or rejected, notify employee
+    if not created and instance.approval_status in ['approved', 'rejected']:
+        send_leave_status_notification.delay(instance.id)
+```
+
+What this does:
+
+Django signals let you listen for events on a model. `post_save` fires every time a Leave object is saved. If it is a new record (`created=True`) we send the application notification. If it is an update and status changed to approved or rejected, we send the status notification. The `.delay()` method is what makes it run in the background via Celery instead of blocking the request.
+
+---
+
+## Step 9 — Register Signals
+
+Open `leaves/apps.py`:
+
+```python
+from django.apps import AppConfig
+
+
+class LeavesConfig(AppConfig):
+    default_auto_field = 'django.db.models.BigAutoField'
+    name = 'leaves'
+
+    def ready(self):
+        import leaves.signals
+```
+
+The `ready` method runs when Django starts. Importing signals here registers them.
+
+---
+
+## Step 10 — Setup Periodic Tasks in Database
+
+Run migrations first for django_celery_beat:
+
+```bash
+python manage.py migrate
+```
+
+Now create a file `leaves/management/commands/setup_periodic_tasks.py`. First create the folders:
+
+```bash
+mkdir leaves/management
+mkdir leaves/management/commands
+```
+
+Create empty `__init__.py` files in both:
+
+```bash
+type nul > leaves/management/__init__.py
+type nul > leaves/management/commands/__init__.py
+```
+
+Now create the file `leaves/management/commands/setup_periodic_tasks.py`:
+
+```python
+from django.core.management.base import BaseCommand
+from django_celery_beat.models import PeriodicTask, CrontabSchedule
+import json
+
+
+class Command(BaseCommand):
+
+    help = 'Setup periodic celery beat tasks'
+
+    def handle(self, *args, **kwargs):
+
+        # Every day at 8 AM
+        daily_schedule, _ = CrontabSchedule.objects.get_or_create(
+            minute='0',
+            hour='8',
+            day_of_week='*',
+            day_of_month='*',
+            month_of_year='*',
+        )
+
+        # Every 1st of the month at midnight
+        monthly_schedule, _ = CrontabSchedule.objects.get_or_create(
+            minute='0',
+            hour='0',
+            day_of_week='*',
+            day_of_month='1',
+            month_of_year='*',
+        )
+
+        PeriodicTask.objects.get_or_create(
+            name='Send Leave Reminders Daily',
+            defaults={
+                'crontab': daily_schedule,
+                'task': 'leaves.tasks.send_leave_reminder',
+                'args': json.dumps([]),
+            }
+        )
+
+        PeriodicTask.objects.get_or_create(
+            name='Auto Close Expired Leaves Daily',
+            defaults={
+                'crontab': daily_schedule,
+                'task': 'leaves.tasks.auto_close_expired_leaves',
+                'args': json.dumps([]),
+            }
+        )
+
+        PeriodicTask.objects.get_or_create(
+            name='Delete Old Cancelled Leaves Monthly',
+            defaults={
+                'crontab': monthly_schedule,
+                'task': 'leaves.tasks.delete_old_cancelled_leaves',
+                'args': json.dumps([]),
+            }
+        )
+
+        self.stdout.write(self.style.SUCCESS('Periodic tasks created successfully.'))
+```
+
+Run this command once to register the scheduled tasks:
+
+```bash
+python manage.py setup_periodic_tasks
+```
+
+---
+
+## Step 11 — Run Everything
+
+You need 3 separate terminals open at the same time.
+
+**Terminal 1 — Django server:**
+```bash
+python manage.py runserver
+```
+
+**Terminal 2 — Celery worker (runs background tasks):**
+```bash
+celery -A leavemanagement worker --loglevel=info --pool=solo
+```
+
+`--pool=solo` is needed on Windows. Without it Celery has issues on Windows.
+
+**Terminal 3 — Celery Beat (runs scheduled tasks):**
+```bash
+celery -A leavemanagement beat --loglevel=info --scheduler django_celery_beat.schedulers:DatabaseScheduler
+```
+
+---
+
+Now whenever someone applies for leave, the email will fire in the background without slowing down the API response. Reply back once this is set up and working and we will move to the final part — filtering, pagination, and standardized responses.
+
+
+
