@@ -2006,3 +2006,1062 @@ Now whenever someone applies for leave, the email will fire in the background wi
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+First let me complete your `accounts/views.py` with logout and reset password, then we will move to next steps.
+
+---
+
+# accounts/views.py
+
+```python
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework import status
+from rest_framework.permissions import AllowAny, IsAuthenticated
+from django.contrib.auth import get_user_model
+from django.core.mail import send_mail
+from django.conf import settings
+from django.utils.crypto import get_random_string
+from rest_framework_simplejwt.tokens import RefreshToken
+from rest_framework_simplejwt.token_blacklist.models import OutstandingToken, BlacklistedToken
+from .serializers import RegisterSerializer, UserSerializer
+
+User = get_user_model()
+
+
+class RegisterView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        serializer = RegisterSerializer(data=request.data)
+        if serializer.is_valid():
+            serializer.save()
+            return Response(
+                {"message": "User registered successfully."},
+                status=status.HTTP_201_CREATED
+            )
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+class PasswordChangeView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        user = request.user
+        old_password = request.data.get("old_password")
+        new_password = request.data.get("new_password")
+
+        if not old_password or not new_password:
+            return Response(
+                {"error": "Both old_password and new_password are required."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if not user.check_password(old_password):
+            return Response(
+                {"error": "Old password is incorrect."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if old_password == new_password:
+            return Response(
+                {"error": "New password cannot be the same as old password."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        user.set_password(new_password)
+        user.save()
+
+        # Blacklist all existing tokens so user has to login again
+        tokens = OutstandingToken.objects.filter(user=user)
+        for token in tokens:
+            BlacklistedToken.objects.get_or_create(token=token)
+
+        return Response({"message": "Password changed successfully. Please login again."})
+
+
+class LogoutView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        refresh_token = request.data.get("refresh")
+
+        if not refresh_token:
+            return Response(
+                {"error": "Refresh token is required."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            token = RefreshToken(refresh_token)
+            token.blacklist()
+            return Response({"message": "Logged out successfully."})
+
+        except Exception:
+            return Response(
+                {"error": "Invalid or already blacklisted token."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+
+class ForgotPasswordView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        email = request.data.get("email")
+
+        if not email:
+            return Response(
+                {"error": "Email is required."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            user = User.objects.get(email=email)
+        except User.DoesNotExist:
+            # We still return success so nobody can guess which emails are registered
+            return Response(
+                {"message": "If this email exists, a reset code has been sent."}
+            )
+
+        # Generate a random 6 digit OTP and save it on the user
+        otp = get_random_string(length=6, allowed_chars='0123456789')
+        user.reset_otp = otp
+        user.save()
+
+        send_mail(
+            subject="Password Reset OTP",
+            message=(
+                f"Dear {user.full_name},\n\n"
+                f"Your password reset OTP is: {otp}\n\n"
+                f"This OTP is valid for 10 minutes.\n"
+                f"If you did not request this, ignore this email."
+            ),
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            recipient_list=[user.email],
+            fail_silently=False,
+        )
+
+        return Response({"message": "If this email exists, a reset code has been sent."})
+
+
+class ResetPasswordView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        email = request.data.get("email")
+        otp = request.data.get("otp")
+        new_password = request.data.get("new_password")
+
+        if not email or not otp or not new_password:
+            return Response(
+                {"error": "Email, otp, and new_password are required."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            user = User.objects.get(email=email)
+        except User.DoesNotExist:
+            return Response(
+                {"error": "Invalid email."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if user.reset_otp != otp:
+            return Response(
+                {"error": "Invalid OTP."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        user.set_password(new_password)
+        user.reset_otp = None
+        user.save()
+
+        # Blacklist all tokens so any existing sessions are invalidated
+        tokens = OutstandingToken.objects.filter(user=user)
+        for token in tokens:
+            BlacklistedToken.objects.get_or_create(token=token)
+
+        return Response({"message": "Password reset successfully. Please login again."})
+```
+
+---
+
+# Add reset_otp field to User model
+
+Open `accounts/models.py` and add one field inside the User class:
+
+```python
+reset_otp = models.CharField(max_length=6, null=True, blank=True)
+```
+
+Then run:
+
+```bash
+python manage.py makemigrations
+python manage.py migrate
+```
+
+---
+
+# Add simplejwt blacklist to INSTALLED_APPS
+
+This is needed for logout and token blacklisting to work. Open `settings.py`:
+
+```python
+INSTALLED_APPS = [
+    ...
+    'rest_framework',
+    'rest_framework_simplejwt.token_blacklist',
+    'accounts',
+    'leaves',
+    'django_celery_beat',
+]
+```
+
+Run migrations again after adding this:
+
+```bash
+python manage.py migrate
+```
+
+---
+
+# Update accounts/urls.py
+
+```python
+from django.urls import path
+from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
+from .views import (
+    RegisterView,
+    PasswordChangeView,
+    LogoutView,
+    ForgotPasswordView,
+    ResetPasswordView,
+)
+
+urlpatterns = [
+    path('register/', RegisterView.as_view(), name='register'),
+    path('login/', TokenObtainPairView.as_view(), name='login'),
+    path('token/refresh/', TokenRefreshView.as_view(), name='token_refresh'),
+    path('logout/', LogoutView.as_view(), name='logout'),
+    path('password/change/', PasswordChangeView.as_view(), name='password_change'),
+    path('password/forgot/', ForgotPasswordView.as_view(), name='forgot_password'),
+    path('password/reset/', ResetPasswordView.as_view(), name='reset_password'),
+]
+```
+
+---
+
+# API Testing Guide
+
+---
+
+**Logout**
+```
+POST /auth/logout/
+Headers: Authorization: Bearer <access_token>
+
+{
+    "refresh": "<your_refresh_token>"
+}
+```
+
+After this the refresh token is blacklisted. The user has to login again to get new tokens.
+
+---
+
+**Forgot Password (sends OTP to email)**
+```
+POST /auth/password/forgot/
+
+{
+    "email": "rishil@example.com"
+}
+```
+
+No auth header needed. Check your email for the 6 digit OTP.
+
+---
+
+**Reset Password (use OTP from email)**
+```
+POST /auth/password/reset/
+
+{
+    "email": "rishil@example.com",
+    "otp": "482910",
+    "new_password": "newpass1234"
+}
+```
+
+No auth header needed. After this all existing sessions are invalidated.
+
+---
+
+**Change Password (when already logged in)**
+```
+POST /auth/password/change/
+Headers: Authorization: Bearer <access_token>
+
+{
+    "old_password": "test1234",
+    "new_password": "newpass1234"
+}
+```
+
+---
+
+Now tell me once all this is working and we will move to the final step which covers filtering, searching, pagination, and standardized API responses across the whole project.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Filtering, Searching, Pagination and Standardized Responses
+
+---
+
+## Step 1 — Install Required Package
+
+```bash
+pip install django-filter
+```
+
+Then add it to `INSTALLED_APPS` in `settings.py`:
+
+```python
+INSTALLED_APPS = [
+    ...
+    'django_filters',
+]
+```
+
+---
+
+## Step 2 — Standardized Response Format
+
+Right now every view returns response in its own way. We need one consistent format across all APIs so every response looks the same.
+
+Create a new file `leavemanagement/utils.py`:
+
+```python
+from rest_framework.response import Response
+from rest_framework import status
+
+
+def success_response(data=None, message="Success", status_code=status.HTTP_200_OK):
+    return Response(
+        {
+            "success": True,
+            "message": message,
+            "data": data,
+        },
+        status=status_code
+    )
+
+
+def error_response(message="Something went wrong", errors=None, status_code=status.HTTP_400_BAD_REQUEST):
+    return Response(
+        {
+            "success": False,
+            "message": message,
+            "errors": errors,
+        },
+        status=status_code
+    )
+```
+
+What this does:
+
+Instead of returning raw data or raw errors, every API will now return a consistent structure. Every success response will have `success`, `message`, and `data`. Every error response will have `success`, `message`, and `errors`. This makes it much easier for frontend or Postman to handle responses predictably.
+
+---
+
+## Step 3 — Pagination
+
+Create a new file `leavemanagement/pagination.py`:
+
+```python
+from rest_framework.pagination import PageNumberPagination
+
+
+class StandardPagination(PageNumberPagination):
+    page_size = 10
+    page_size_query_param = 'page_size'
+    max_page_size = 100
+```
+
+What this does:
+
+By default returns 10 records per page. The person calling the API can pass `?page_size=20` to get more. Maximum allowed is 100 per page. To go to the next page they pass `?page=2`.
+
+Now tell Django to use this pagination globally. Add this to `settings.py`:
+
+```python
+REST_FRAMEWORK = {
+    'DEFAULT_AUTHENTICATION_CLASSES': (
+        'rest_framework_simplejwt.authentication.JWTAuthentication',
+    ),
+    'DEFAULT_PERMISSION_CLASSES': (
+        'rest_framework.permissions.IsAuthenticated',
+    ),
+    'DEFAULT_PAGINATION_CLASS': 'leavemanagement.pagination.StandardPagination',
+    'PAGE_SIZE': 10,
+}
+```
+
+---
+
+## Step 4 — Filters
+
+Create a new file `leaves/filters.py`:
+
+```python
+import django_filters
+from .models import Leave, Holiday
+
+
+class LeaveFilter(django_filters.FilterSet):
+
+    leave_type = django_filters.CharFilter(
+        field_name='leave_type',
+        lookup_expr='exact'
+    )
+
+    approval_status = django_filters.CharFilter(
+        field_name='approval_status',
+        lookup_expr='exact'
+    )
+
+    leave_status = django_filters.CharFilter(
+        field_name='leave_status',
+        lookup_expr='exact'
+    )
+
+    start_date = django_filters.DateFilter(
+        field_name='start_date',
+        lookup_expr='gte'
+    )
+
+    end_date = django_filters.DateFilter(
+        field_name='end_date',
+        lookup_expr='lte'
+    )
+
+    employee_name = django_filters.CharFilter(
+        field_name='employee__full_name',
+        lookup_expr='icontains'
+    )
+
+    department = django_filters.CharFilter(
+        field_name='employee__department',
+        lookup_expr='icontains'
+    )
+
+    class Meta:
+        model = Leave
+        fields = [
+            'leave_type',
+            'approval_status',
+            'leave_status',
+            'start_date',
+            'end_date',
+            'employee_name',
+            'department',
+        ]
+
+
+class HolidayFilter(django_filters.FilterSet):
+
+    month = django_filters.NumberFilter(
+        field_name='date',
+        lookup_expr='month'
+    )
+
+    year = django_filters.NumberFilter(
+        field_name='date',
+        lookup_expr='year'
+    )
+
+    class Meta:
+        model = Holiday
+        fields = ['month', 'year']
+```
+
+What this does:
+
+`LeaveFilter` lets you filter the leave list by multiple fields at once. For example you can do `?leave_type=paid&approval_status=pending&department=Engineering` and it will return only leaves matching all those conditions.
+
+`lookup_expr='icontains'` means case-insensitive partial match. So searching `employee_name=ris` will match `Rishil`.
+
+`lookup_expr='gte'` on start_date means greater than or equal. So `?start_date=2025-05-01` returns leaves starting from that date onwards.
+
+`HolidayFilter` lets you filter holidays by month or year. `?month=8` gives all August holidays.
+
+---
+
+## Step 5 — Update leaves/views.py
+
+Now update your full `leaves/views.py` to use filters, pagination, and standardized responses:
+
+```python
+from rest_framework.views import APIView
+from rest_framework.permissions import IsAuthenticated
+from django.shortcuts import get_object_or_404
+from django.contrib.auth import get_user_model
+from django_filters.rest_framework import DjangoFilterBackend
+from rest_framework.filters import SearchFilter, OrderingFilter
+from leavemanagement.utils import success_response, error_response
+from leavemanagement.pagination import StandardPagination
+from .models import Leave, LeaveBalance, Holiday, CustomNotifyList
+from .serializers import (
+    LeaveSerializer,
+    LeaveApprovalSerializer,
+    LeaveBalanceSerializer,
+    HolidaySerializer,
+    CustomNotifyListSerializer,
+)
+from .filters import LeaveFilter, HolidayFilter
+import django_filters
+
+User = get_user_model()
+
+
+def can_approve(approver, employee):
+    if approver.is_superuser or approver.is_hr or approver.role == 'hr':
+        return True
+    if approver.role == 'cto' and employee.role == 'engineering_manager':
+        return True
+    if employee.reports_to and employee.reports_to == approver:
+        return True
+    return False
+
+
+def can_apply_on_behalf(requester, target_employee):
+    if requester.is_hr or requester.role == 'hr':
+        return True
+    if target_employee.reports_to and target_employee.reports_to == requester:
+        return True
+    if (target_employee.reports_to and
+            target_employee.reports_to.reports_to and
+            target_employee.reports_to.reports_to == requester):
+        return True
+    return False
+
+
+def can_view_leave(viewer, leave):
+    employee = leave.employee
+    if viewer.is_superuser or viewer.is_hr or viewer.role == 'hr':
+        return True
+    if employee == viewer:
+        return True
+    if employee.reports_to == viewer:
+        return True
+    if employee.reports_to and employee.reports_to.reports_to == viewer:
+        return True
+    return False
+
+
+class LeaveListCreateView(APIView):
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        user = request.user
+
+        if user.is_superuser or user.is_hr or user.role == 'hr':
+            leaves = Leave.objects.all()
+
+        elif user.role in ['team_lead', 'manager', 'engineering_manager', 'cto']:
+            direct_ids = list(user.subordinates.values_list('id', flat=True))
+            second_level_ids = list(
+                User.objects.filter(
+                    reports_to__in=direct_ids
+                ).values_list('id', flat=True)
+            )
+            all_ids = set(direct_ids + second_level_ids + [user.id])
+            leaves = Leave.objects.filter(employee__in=all_ids)
+
+        else:
+            leaves = Leave.objects.filter(employee=user)
+
+        # Apply filters
+        filterset = LeaveFilter(request.query_params, queryset=leaves)
+        if not filterset.is_valid():
+            return error_response(
+                message="Invalid filters.",
+                errors=filterset.errors
+            )
+        leaves = filterset.qs
+
+        # Search by employee name or title
+        search = request.query_params.get('search')
+        if search:
+            leaves = leaves.filter(
+                title__icontains=search
+            ) | leaves.filter(
+                employee__full_name__icontains=search
+            )
+
+        # Ordering
+        ordering = request.query_params.get('ordering', '-created_at')
+        allowed_ordering = [
+            'created_at', '-created_at',
+            'start_date', '-start_date',
+            'end_date', '-end_date',
+        ]
+        if ordering in allowed_ordering:
+            leaves = leaves.order_by(ordering)
+        else:
+            leaves = leaves.order_by('-created_at')
+
+        # Pagination
+        paginator = StandardPagination()
+        paginated = paginator.paginate_queryset(leaves, request)
+        serializer = LeaveSerializer(paginated, many=True)
+
+        return success_response(
+            data={
+                "count": paginator.page.paginator.count,
+                "next": paginator.get_next_link(),
+                "previous": paginator.get_previous_link(),
+                "results": serializer.data,
+            },
+            message="Leaves fetched successfully."
+        )
+
+    def post(self, request):
+        serializer = LeaveSerializer(data=request.data)
+        if serializer.is_valid():
+            serializer.save(
+                employee=request.user,
+                applied_by=request.user
+            )
+            return success_response(
+                data=serializer.data,
+                message="Leave applied successfully.",
+                status_code=201
+            )
+        return error_response(
+            message="Failed to apply leave.",
+            errors=serializer.errors
+        )
+
+
+class LeaveDetailView(APIView):
+
+    permission_classes = [IsAuthenticated]
+
+    def get_leave(self, leave_id):
+        return get_object_or_404(Leave, id=leave_id)
+
+    def get(self, request, leave_id):
+        leave = self.get_leave(leave_id)
+
+        if not can_view_leave(request.user, leave):
+            return error_response(
+                message="You do not have permission to view this leave.",
+                status_code=403
+            )
+
+        serializer = LeaveSerializer(leave)
+        return success_response(
+            data=serializer.data,
+            message="Leave fetched successfully."
+        )
+
+    def patch(self, request, leave_id):
+        leave = self.get_leave(leave_id)
+        user = request.user
+
+        if request.data.get('approval_status') == 'cancelled':
+            if leave.employee != user:
+                return error_response(
+                    message="You can only cancel your own leave.",
+                    status_code=403
+                )
+            leave.approval_status = 'cancelled'
+            leave.save()
+            return success_response(message="Leave cancelled successfully.")
+
+        if not can_approve(user, leave.employee):
+            return error_response(
+                message="You do not have permission to approve or reject this leave.",
+                status_code=403
+            )
+
+        serializer = LeaveApprovalSerializer(leave, data=request.data, partial=True)
+        if serializer.is_valid():
+            serializer.save(approved_by=user)
+            return success_response(
+                data=serializer.data,
+                message=f"Leave {serializer.validated_data['approval_status']} by {user.full_name}."
+            )
+        return error_response(
+            message="Failed to update leave.",
+            errors=serializer.errors
+        )
+
+
+class ApplyOnBehalfView(APIView):
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, emp_id):
+        employee = get_object_or_404(User, id=emp_id)
+
+        if not can_apply_on_behalf(request.user, employee):
+            return error_response(
+                message="You do not have permission to apply leave for this employee.",
+                status_code=403
+            )
+
+        serializer = LeaveSerializer(data=request.data)
+        if serializer.is_valid():
+            serializer.save(
+                employee=employee,
+                applied_by=request.user
+            )
+            return success_response(
+                data=serializer.data,
+                message=f"Leave applied on behalf of {employee.full_name}.",
+                status_code=201
+            )
+        return error_response(
+            message="Failed to apply leave.",
+            errors=serializer.errors
+        )
+
+
+class LeaveBalanceView(APIView):
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        balances = LeaveBalance.objects.filter(employee=request.user)
+        serializer = LeaveBalanceSerializer(balances, many=True)
+        return success_response(
+            data=serializer.data,
+            message="Leave balance fetched successfully."
+        )
+
+
+class HolidayListView(APIView):
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        holidays = Holiday.objects.all().order_by('date')
+
+        filterset = HolidayFilter(request.query_params, queryset=holidays)
+        if filterset.is_valid():
+            holidays = filterset.qs
+
+        paginator = StandardPagination()
+        paginated = paginator.paginate_queryset(holidays, request)
+        serializer = HolidaySerializer(paginated, many=True)
+
+        return success_response(
+            data={
+                "count": paginator.page.paginator.count,
+                "next": paginator.get_next_link(),
+                "previous": paginator.get_previous_link(),
+                "results": serializer.data,
+            },
+            message="Holidays fetched successfully."
+        )
+
+    def post(self, request):
+        if not (request.user.is_hr or request.user.role == 'hr'):
+            return error_response(
+                message="Only HR can add holidays.",
+                status_code=403
+            )
+
+        serializer = HolidaySerializer(data=request.data)
+        if serializer.is_valid():
+            serializer.save()
+            return success_response(
+                data=serializer.data,
+                message="Holiday added successfully.",
+                status_code=201
+            )
+        return error_response(
+            message="Failed to add holiday.",
+            errors=serializer.errors
+        )
+
+
+class LeaveBalanceManageView(APIView):
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        if not (request.user.is_hr or request.user.role == 'hr'):
+            return error_response(
+                message="Only HR can manage leave balances.",
+                status_code=403
+            )
+
+        employee_id = request.data.get('employee')
+        leave_type = request.data.get('leave_type')
+        credited = request.data.get('credited', 0)
+
+        if not employee_id or not leave_type:
+            return error_response(
+                message="employee and leave_type are required."
+            )
+
+        employee = get_object_or_404(User, id=employee_id)
+
+        balance, created = LeaveBalance.objects.get_or_create(
+            employee=employee,
+            leave_type=leave_type,
+            defaults={'credited': 0, 'used': 0}
+        )
+        balance.credited += float(credited)
+        balance.save()
+
+        return success_response(
+            data=LeaveBalanceSerializer(balance).data,
+            message=f"Leave balance updated for {employee.full_name}."
+        )
+
+
+class CustomNotifyListView(APIView):
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        notify_list = CustomNotifyList.objects.filter(employee=request.user)
+        serializer = CustomNotifyListSerializer(notify_list, many=True)
+        return success_response(
+            data=serializer.data,
+            message="Notify list fetched successfully."
+        )
+
+    def post(self, request):
+        serializer = CustomNotifyListSerializer(data=request.data)
+        if serializer.is_valid():
+            serializer.save(employee=request.user)
+            return success_response(
+                data=serializer.data,
+                message="Added to notify list.",
+                status_code=201
+            )
+        return error_response(
+            message="Failed to add to notify list.",
+            errors=serializer.errors
+        )
+
+    def delete(self, request, notify_id):
+        notify = get_object_or_404(
+            CustomNotifyList,
+            id=notify_id,
+            employee=request.user
+        )
+        notify.delete()
+        return success_response(message="Removed from notify list.")
+```
+
+---
+
+## Step 6 — Update accounts/views.py for Standardized Responses
+
+Open `accounts/views.py` and add the imports at the top:
+
+```python
+from leavemanagement.utils import success_response, error_response
+```
+
+Then replace every `return Response(...)` with `success_response` or `error_response`. For example:
+
+```python
+# Before
+return Response({"message": "User registered successfully."}, status=status.HTTP_201_CREATED)
+
+# After
+return success_response(message="User registered successfully.", status_code=201)
+```
+
+Do this for all views in accounts so the format stays consistent everywhere.
+
+---
+
+## API Testing Guide for This Step
+
+---
+
+**Get all leaves with filters:**
+
+```
+GET /leaves/?leave_type=paid
+GET /leaves/?approval_status=pending
+GET /leaves/?department=Engineering
+GET /leaves/?employee_name=rishil
+GET /leaves/?start_date=2025-05-01
+GET /leaves/?leave_type=paid&approval_status=pending
+```
+
+---
+
+**Search by title or employee name:**
+
+```
+GET /leaves/?search=vacation
+GET /leaves/?search=rishil
+```
+
+---
+
+**Ordering:**
+
+```
+GET /leaves/?ordering=start_date
+GET /leaves/?ordering=-start_date
+GET /leaves/?ordering=-created_at
+```
+
+---
+
+**Pagination:**
+
+```
+GET /leaves/?page=1
+GET /leaves/?page=2
+GET /leaves/?page_size=5
+GET /leaves/?page=2&page_size=5
+```
+
+---
+
+**Filter holidays by month or year:**
+
+```
+GET /leaves/holidays/?month=8
+GET /leaves/holidays/?year=2025
+GET /leaves/holidays/?month=8&year=2025
+```
+
+---
+
+**Sample standardized success response you will see now:**
+
+```json
+{
+    "success": true,
+    "message": "Leaves fetched successfully.",
+    "data": {
+        "count": 25,
+        "next": "http://127.0.0.1:8000/leaves/?page=2",
+        "previous": null,
+        "results": [...]
+    }
+}
+```
+
+**Sample standardized error response:**
+
+```json
+{
+    "success": false,
+    "message": "Failed to apply leave.",
+    "errors": {
+        "start_date": ["This field is required."]
+    }
+}
+```
+
+---
+
+The core system is now complete. Once this is working, the only thing remaining is writing a proper `README.md` for your project which documents all APIs, setup steps, and environment variables. Want me to generate that as well?
