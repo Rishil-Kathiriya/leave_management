@@ -3065,3 +3065,153 @@ GET /leaves/holidays/?month=8&year=2025
 ---
 
 The core system is now complete. Once this is working, the only thing remaining is writing a proper `README.md` for your project which documents all APIs, setup steps, and environment variables. Want me to generate that as well?
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Employee updates their own profile
+PATCH /auth/profile/
+Headers: Authorization: Bearer <access_token>
+
+{
+    "full_name": "Rishil Kathiriya Updated"
+}
+Only full_name and department are allowed. Anything else is ignored silently.
+
+HR updates any employee profile
+PATCH /auth/profile/3/
+Headers: Authorization: Bearer <hr_access_token>
+
+{
+    "role": "senior_software_engineer",
+    "is_hr": false,
+    "reports_to": 2
+}
+HR can update full_name, department, role, is_hr, reports_to.
+
+HR tries to update CTO — will get error
+PATCH /auth/profile/<cto_id>/
+Headers: Authorization: Bearer <hr_access_token>
+
+{
+    "full_name": "New Name"
+}
+
+Response:
+{
+    "success": false,
+    "message": "HR cannot update CTO profile.",
+    "errors": null
+}
+
+Get all employees (HR sees everyone)
+GET /auth/employees/
+Headers: Authorization: Bearer <hr_access_token>
+
+Search employees
+GET /auth/employees/?search=rishil
+GET /auth/employees/?department=Engineering
+GET /auth/employees/?role=trainee
+GET /auth/employees/?search=rishil&department=Engineering
+
+That covers the full accounts module. Let me know when this is working and we will wrap up with the README.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
