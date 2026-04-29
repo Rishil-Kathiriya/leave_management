@@ -3215,3 +3215,127 @@ That covers the full accounts module. Let me know when this is working and we wi
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Let me read the frontend design skill first.Since you want plain and basic — just functionality, no decoration — I will keep it dead simple. Plain HTML, no styling frameworks, just forms and buttons that work.---
+
+# How to Use This UI
+
+---
+
+## Step 1 — Allow CORS in Django
+
+The browser will block requests from the HTML file to your Django server unless you allow it. Install this:
+
+```bash
+pip install django-cors-headers
+```
+
+Add to `INSTALLED_APPS` in settings.py:
+
+```python
+'corsheaders',
+```
+
+Add to `MIDDLEWARE` in settings.py — must be at the very top:
+
+```python
+MIDDLEWARE = [
+    'corsheaders.middleware.CorsMiddleware',  # this line first
+    'django.middleware.security.SecurityMiddleware',
+    ...
+]
+```
+
+Add this at the bottom of settings.py:
+
+```python
+CORS_ALLOW_ALL_ORIGINS = True
+```
+
+---
+
+## Step 2 — Add Profile GET endpoint
+
+The UI calls `GET /auth/profile/` to load the logged in user. Add this to `accounts/views.py`:
+
+```python
+class ProfileView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        serializer = UserSerializer(request.user)
+        return success_response(
+            data=serializer.data,
+            message="Profile fetched successfully."
+        )
+```
+
+And in `accounts/urls.py` update the profile path:
+
+```python
+from .views import ProfileView
+
+path('profile/', ProfileView.as_view(), name='profile'),
+```
+
+Now your `UpdateProfileView` and `ProfileView` are two separate views on the same URL — GET fetches, PATCH updates.
+
+---
+
+## Step 3 — Run Django
+
+```bash
+python manage.py runserver
+```
+
+---
+
+## Step 4 — Open the HTML file
+
+Just double click `index.html` in your file explorer. It will open in your browser. No server needed for the UI.
+
+---
+
+## How to Test Each Feature
+
+**Register** — Click Register in nav, fill the form, submit. You will see success message.
+
+**Login** — Enter email and password. On success you are taken to My Leaves automatically.
+
+**Apply Leave** — Click Apply Leave, fill all fields, submit.
+
+**View and Approve** — Go to My Leaves, click View on any leave. If you are the approver you will see Approve and Reject buttons. If it is your own leave you will see Cancel.
+
+**Leave Balance** — Click Leave Balance to see credited, used, remaining per type.
+
+**Holidays** — Filter by month or year and click Search.
+
+**HR Features** — Login as an HR user. You will see extra buttons in the nav: Add Holiday, Manage Balance, All Employees, Apply on Behalf.
+
+**Profile** — Click My Profile to see your details and update name or department. Change password is also there.
+
+
+
